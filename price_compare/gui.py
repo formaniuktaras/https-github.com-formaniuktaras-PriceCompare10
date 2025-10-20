@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import csv
 import json
 import re
 import threading
@@ -2775,7 +2776,23 @@ class TagsTab(ttk.Frame):
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self._update_tree())
 
+        self.supplier_var = tk.StringVar(value="Усі постачальники")
+        self.status_filter = tk.StringVar(value="all")
+        self.category_select_all = tk.BooleanVar(value=True)
+        self.uncategorized_var = tk.BooleanVar(value=True)
+        self.summary_var = tk.StringVar(value="Відбір: 0 з 0")
+        self._status_labels: Dict[str, str] = {
+            "all": "Всі товари",
+            "pending": "Зі збігами",
+            "no_tags": "Без тегів",
+            "confirmed": "Зі збереженими",
+            "errors": "З помилками",
+        }
+        self._status_label_lookup = {label: key for key, label in self._status_labels.items()}
+
         self._item_to_key: Dict[str, str] = {}
+        self._category_vars: Dict[str, tk.BooleanVar] = {}
+        self._category_checks: Dict[str, ttk.Checkbutton] = {}
 
         self._build_ui()
 
@@ -2814,55 +2831,202 @@ class TagsTab(ttk.Frame):
 
         tags_assignment.validate_tags(assignments.values(), self.templates)
         self.assignments = assignments
+        self._rebuild_category_filters()
+        self._refresh_supplier_options()
+        self._restore_status_selection()
         self._update_tree()
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        controls = ttk.Frame(self)
-        controls.pack(fill=tk.X, padx=8, pady=(8, 4))
+        style = ttk.Style()
+        style.configure("TagsFilters.TFrame", background="#f4f6fb")
+        style.configure("TagsFiltersHeading.TLabel", font=("Segoe UI", 11, "bold"), background="#f4f6fb")
+        style.configure("TagsFilters.TLabel", background="#f4f6fb")
+        style.configure("Tags.Treeview", rowheight=28, font=("Segoe UI", 10))
+        style.configure("Tags.Treeview.Heading", font=("Segoe UI Semibold", 10))
+        style.configure("TagsAccent.TButton", font=("Segoe UI Semibold", 10))
+        style.configure("TagsSecondary.TButton", font=("Segoe UI", 10))
+        style.configure("TagsLink.TButton", font=("Segoe UI", 10), foreground="#2563eb")
+        style.map(
+            "TagsLink.TButton",
+            foreground=[("active", "#1d4ed8"), ("pressed", "#1d4ed8")],
+        )
 
-        ttk.Label(controls, text="Пошук:").grid(row=0, column=0, sticky=tk.W, padx=(0, 6))
-        search_entry = ttk.Entry(controls, textvariable=self.search_var)
-        search_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 12))
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        filters_frame = ttk.Frame(self, style="TagsFilters.TFrame", padding=(18, 18))
+        filters_frame.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(16, 12), pady=16)
+        filters_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(filters_frame, text="Фільтри", style="TagsFiltersHeading.TLabel").grid(
+            row=0, column=0, sticky=tk.W
+        )
+
+        status_frame = ttk.Frame(filters_frame, style="TagsFilters.TFrame")
+        status_frame.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        ttk.Label(status_frame, text="Статус тегів", style="TagsFilters.TLabel").grid(
+            row=0, column=0, sticky=tk.W
+        )
+        for index, (value, label) in enumerate(
+            [
+                ("all", "Всі товари"),
+                ("pending", "Зі збігами"),
+                ("no_tags", "Без тегів"),
+                ("confirmed", "Зі збереженими"),
+                ("errors", "З помилками"),
+            ]
+        ):
+            ttk.Radiobutton(
+                status_frame,
+                text=label,
+                value=value,
+                variable=self.status_filter,
+                command=self._on_status_filter_changed,
+            ).grid(row=index + 1, column=0, sticky=tk.W, pady=(6 if index == 0 else 4, 0))
+
+        ttk.Separator(filters_frame).grid(row=2, column=0, sticky="ew", pady=(18, 12))
+
+        categories_header = ttk.Frame(filters_frame, style="TagsFilters.TFrame")
+        categories_header.grid(row=3, column=0, sticky="ew")
+        ttk.Label(
+            categories_header,
+            text="Категорії",
+            style="TagsFilters.TLabel",
+        ).grid(row=0, column=0, sticky=tk.W)
+
+        ttk.Checkbutton(
+            categories_header,
+            text="Всі категорії",
+            variable=self.category_select_all,
+            command=self._toggle_category_all,
+        ).grid(row=1, column=0, sticky=tk.W, pady=(8, 4))
+
+        self.category_container = ttk.Frame(filters_frame, style="TagsFilters.TFrame")
+        self.category_container.grid(row=4, column=0, sticky="ew")
+
+        ttk.Checkbutton(
+            self.category_container,
+            text="Без категорії",
+            variable=self.uncategorized_var,
+            command=self._on_category_filter_changed,
+        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 6))
+
+        ttk.Separator(filters_frame).grid(row=5, column=0, sticky="ew", pady=(18, 12))
+
+        ttk.Button(
+            filters_frame,
+            text="Масово застосувати",
+            style="TagsSecondary.TButton",
+            command=self._apply_to_selected,
+        ).grid(row=6, column=0, sticky="ew")
+
+        ttk.Button(
+            filters_frame,
+            text="Скинути фільтри",
+            style="TagsSecondary.TButton",
+            command=self._reset_filters,
+        ).grid(row=7, column=0, sticky="ew", pady=(8, 0))
+
+        filters_frame.rowconfigure(8, weight=1)
+
+        ttk.Button(
+            filters_frame,
+            text="Редагувати шаблони",
+            style="TagsLink.TButton",
+            command=self._edit_templates,
+        ).grid(row=9, column=0, sticky=tk.W, pady=(16, 4))
+        ttk.Button(
+            filters_frame,
+            text="Правила тегування",
+            style="TagsLink.TButton",
+            command=self._edit_rules,
+        ).grid(row=10, column=0, sticky=tk.W)
+
+        content = ttk.Frame(self, padding=(0, 16, 16, 16))
+        content.grid(row=0, column=1, sticky="nsew", rowspan=2)
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(2, weight=1)
+
+        controls = ttk.Frame(content)
+        controls.grid(row=0, column=0, sticky="ew")
         controls.columnconfigure(1, weight=1)
 
+        search_frame = ttk.Frame(controls)
+        search_frame.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        search_frame.columnconfigure(1, weight=1)
+        ttk.Label(search_frame, text="🔍").grid(row=0, column=0, padx=(0, 6))
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
+        self.search_entry.grid(row=0, column=1, sticky="ew")
+
+        combobox_frame = ttk.Frame(controls)
+        combobox_frame.grid(row=0, column=1, sticky="ew")
+        combobox_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(combobox_frame, text="Постачальник:").grid(row=0, column=0, sticky=tk.W)
+        self.supplier_combo = ttk.Combobox(
+            combobox_frame,
+            textvariable=self.supplier_var,
+            state="readonly",
+            width=26,
+        )
+        self.supplier_combo.grid(row=0, column=1, sticky=tk.W, padx=(4, 12))
+        self.supplier_combo.set(self.supplier_var.get())
+        self.supplier_combo.bind("<<ComboboxSelected>>", lambda *_: self._update_tree())
+
+        ttk.Label(combobox_frame, text="Статус:").grid(row=0, column=2, sticky=tk.W)
+        self.status_combo = ttk.Combobox(
+            combobox_frame,
+            state="readonly",
+            width=24,
+            values=[
+                "Всі товари",
+                "Зі збігами",
+                "Без тегів",
+                "Зі збереженими",
+                "З помилками",
+            ],
+        )
+        self.status_combo.grid(row=0, column=3, sticky=tk.W)
+        self.status_combo.set(self._status_labels.get("all", "Всі товари"))
+        self.status_combo.bind("<<ComboboxSelected>>", self._on_status_combo_selected)
+
+        buttons = ttk.Frame(content)
+        buttons.grid(row=1, column=0, sticky="ew", pady=(16, 12))
+        buttons.columnconfigure(0, weight=1)
+
+        actions = ttk.Frame(buttons)
+        actions.grid(row=0, column=0, sticky=tk.W)
+
         ttk.Button(
-            controls,
-            text="Автоматично присвоїти теги",
+            actions,
+            text="Оновити",
+            style="TagsSecondary.TButton",
+            command=self.refresh_products,
+        ).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(
+            actions,
+            text="Автоприсвоїти",
+            style="TagsAccent.TButton",
             command=self._run_auto_tagging,
-        ).grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
+        ).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(
-            controls,
+            actions,
             text="Оновити мітки",
+            style="TagsSecondary.TButton",
             command=lambda: self._run_auto_tagging(reload_saved=True),
-        ).grid(row=0, column=3, sticky=tk.W)
-
+        ).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(
-            controls,
-            text="Редагувати шаблони моделей",
-            command=self._edit_templates,
-        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
-        ttk.Button(
-            controls,
-            text="Редагувати правила тегування",
-            command=self._edit_rules,
-        ).grid(row=1, column=2, columnspan=2, sticky=tk.W, pady=(8, 0))
-
-        ttk.Button(
-            controls,
-            text="Масово застосувати обрані теги",
-            command=self._apply_to_selected,
-        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
-        ttk.Button(
-            controls,
-            text="Зберегти теги",
+            actions,
+            text="Зберегти",
+            style="TagsAccent.TButton",
             command=self._save_assignments,
-        ).grid(row=2, column=2, columnspan=2, sticky=tk.E, pady=(8, 0))
+        ).grid(row=0, column=3)
 
-        tree_frame = ttk.Frame(self)
-        tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        tree_frame = ttk.Frame(content, relief=tk.GROOVE, borderwidth=1)
+        tree_frame.grid(row=2, column=0, sticky="nsew")
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
 
@@ -2872,6 +3036,7 @@ class TagsTab(ttk.Frame):
             columns=columns,
             show="headings",
             selectmode="extended",
+            style="Tags.Treeview",
         )
         self.tree.grid(row=0, column=0, sticky="nsew")
 
@@ -2885,28 +3050,201 @@ class TagsTab(ttk.Frame):
             "sku": "SKU",
             "name": "Назва",
             "current": "Поточні теги",
-            "proposed": "Пропоновані теги",
+            "proposed": "Пропозиції",
             "category": "Категорія",
             "apply": "✔",
         }
         widths = {
             "sku": 130,
-            "name": 320,
-            "current": 220,
-            "proposed": 260,
-            "category": 140,
-            "apply": 40,
+            "name": 340,
+            "current": 240,
+            "proposed": 280,
+            "category": 150,
+            "apply": 60,
         }
         for column in columns:
             self.tree.heading(column, text=headers[column])
             self.tree.column(column, width=widths[column], anchor=tk.W)
 
-        self.tree.tag_configure("confirmed", background="#9bd179")
-        self.tree.tag_configure("pending", background="#f5e9a4")
-        self.tree.tag_configure("error", background="#d1a3a7")
+        self.tree.tag_configure(
+            "confirmed",
+            background="#e8f5e9",
+            foreground="#2e7d32",
+        )
+        self.tree.tag_configure(
+            "pending",
+            background="#fff8e1",
+            foreground="#8d6e00",
+        )
+        self.tree.tag_configure(
+            "error",
+            background="#fdecea",
+            foreground="#c62828",
+        )
 
         self.tree.bind("<Double-1>", self._on_tree_double_click)
         self.tree.bind("<Button-1>", self._on_tree_click, add="+")
+
+        self._empty_label = ttk.Label(tree_frame, text="Немає результатів", foreground="#6b7280")
+        self._empty_label.place_forget()
+
+        footer = ttk.Frame(content)
+        footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(footer, textvariable=self.summary_var).grid(row=0, column=0, sticky=tk.W)
+        ttk.Button(
+            footer,
+            text="Експорт таблиці…",
+            style="TagsSecondary.TButton",
+            command=self._export_current_view,
+        ).grid(row=0, column=1, sticky=tk.E)
+
+    def _on_status_filter_changed(self) -> None:
+        label = self._status_labels.get(self.status_filter.get(), "Всі товари")
+        if hasattr(self, "status_combo"):
+            try:
+                if self.status_combo.get() != label:
+                    self.status_combo.set(label)
+            except tk.TclError:
+                self.status_combo.set(label)
+        self._update_tree()
+
+    def _on_status_combo_selected(self, event: tk.Event[tk.Misc]) -> None:  # type: ignore[name-defined]
+        selected = self.status_combo.get()
+        key = self._status_label_lookup.get(selected)
+        if key and self.status_filter.get() != key:
+            self.status_filter.set(key)
+            self._update_tree()
+
+    def _toggle_category_all(self) -> None:
+        value = bool(self.category_select_all.get())
+        for var in self._category_vars.values():
+            var.set(value)
+        self.uncategorized_var.set(value)
+        self._update_tree()
+
+    def _on_category_filter_changed(self) -> None:
+        if self._category_vars:
+            all_selected = all(var.get() for var in self._category_vars.values())
+        else:
+            all_selected = True
+        all_selected = all_selected and bool(self.uncategorized_var.get())
+        if bool(self.category_select_all.get()) != all_selected:
+            self.category_select_all.set(all_selected)
+        self._update_tree()
+
+    def _reset_filters(self) -> None:
+        self.search_var.set("")
+        if hasattr(self, "supplier_combo"):
+            try:
+                self.supplier_combo.set("Усі постачальники")
+            except tk.TclError:
+                pass
+        self.supplier_var.set("Усі постачальники")
+        self.status_filter.set("all")
+        if hasattr(self, "status_combo"):
+            try:
+                self.status_combo.set(self._status_labels["all"])
+            except tk.TclError:
+                pass
+        self.category_select_all.set(True)
+        self.uncategorized_var.set(True)
+        for var in self._category_vars.values():
+            var.set(True)
+        self._update_tree()
+
+    def _rebuild_category_filters(self) -> None:
+        if not hasattr(self, "category_container"):
+            return
+
+        categories = sorted(
+            {
+                assignment.category
+                for assignment in self.assignments.values()
+                if assignment.category
+            }
+        )
+
+        current_keys = set(self._category_vars)
+        target_keys = set(categories)
+
+        for name in current_keys - target_keys:
+            widget = self._category_checks.pop(name, None)
+            if widget is not None:
+                widget.destroy()
+            self._category_vars.pop(name, None)
+
+        for row, name in enumerate(categories, start=1):
+            if name not in self._category_vars:
+                var = tk.BooleanVar(value=bool(self.category_select_all.get()))
+                self._category_vars[name] = var
+                self._category_checks[name] = ttk.Checkbutton(
+                    self.category_container,
+                    text=name,
+                    variable=var,
+                    command=self._on_category_filter_changed,
+                )
+            check = self._category_checks[name]
+            check.grid(row=row, column=0, sticky=tk.W, pady=(0, 4))
+
+        self._on_category_filter_changed()
+
+    def _refresh_supplier_options(self) -> None:
+        if not hasattr(self, "supplier_combo"):
+            return
+
+        suppliers = sorted(
+            {
+                assignment.product.supplier or "Невідомий"
+                for assignment in self.assignments.values()
+            }
+        )
+        values = ["Усі постачальники"] + suppliers
+        current = self.supplier_var.get()
+        if current not in values:
+            current = "Усі постачальники"
+        self.supplier_combo["values"] = values
+        try:
+            self.supplier_combo.set(current)
+        except tk.TclError:
+            self.after(0, lambda: self.supplier_combo.set(current))
+        self.supplier_var.set(current)
+
+    def _restore_status_selection(self) -> None:
+        if not hasattr(self, "status_combo"):
+            return
+        label = self._status_labels.get(self.status_filter.get(), "Всі товари")
+        try:
+            self.status_combo.set(label)
+        except tk.TclError:
+            self.after(0, lambda value=label: self.status_combo.set(value))
+
+    def _export_current_view(self) -> None:
+        rows = [self.tree.item(item, "values") for item in self.tree.get_children("")]
+        if not rows:
+            messagebox.showinfo("Експорт", "Немає даних для експорту.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Експорт тегів",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Усі файли", "*.*")],
+        )
+        if not path:
+            return
+
+        headers = ["SKU", "Назва", "Поточні теги", "Пропозиції", "Категорія", "Застосувати"]
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fp:
+                writer = csv.writer(fp)
+                writer.writerow(headers)
+                writer.writerows(rows)
+        except Exception as exc:
+            messagebox.showerror("Експорт", f"Не вдалося зберегти файл: {exc}")
+            return
+
+        messagebox.showinfo("Експорт", "Експорт завершено успішно.")
 
     # ------------------------------------------------------------------
     # Actions
@@ -2947,6 +3285,8 @@ class TagsTab(ttk.Frame):
 
         self.assignments = updated
         tags_assignment.validate_tags(self.assignments.values(), self.templates)
+        self._rebuild_category_filters()
+        self._refresh_supplier_options()
         self._update_tree()
 
     def _apply_to_selected(self) -> None:
@@ -2968,6 +3308,7 @@ class TagsTab(ttk.Frame):
 
         if changed:
             tags_assignment.validate_tags(self.assignments.values(), self.templates)
+            self._rebuild_category_filters()
             self._update_tree()
 
     def _save_assignments(self) -> None:
@@ -2990,6 +3331,7 @@ class TagsTab(ttk.Frame):
         if self.on_save:
             self.on_save(assignments)
 
+        self._rebuild_category_filters()
         self._update_tree()
         messagebox.showinfo("Мітки", "Теги успішно збережено.")
 
@@ -3018,6 +3360,9 @@ class TagsTab(ttk.Frame):
     # Tree helpers
     # ------------------------------------------------------------------
     def _update_tree(self) -> None:
+        if not hasattr(self, "tree"):
+            return
+
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._item_to_key.clear()
@@ -3031,6 +3376,28 @@ class TagsTab(ttk.Frame):
                 item[1].product.sku or "",
             ),
         )
+
+        supplier_value = self.supplier_var.get()
+        if not supplier_value or supplier_value == "Усі постачальники":
+            supplier_filter: Set[str] | None = None
+        else:
+            supplier_filter = {supplier_value}
+
+        status_filter = self.status_filter.get()
+
+        active_categories = {
+            name for name, var in self._category_vars.items() if var.get()
+        }
+        include_uncategorized = bool(self.uncategorized_var.get())
+        if self._category_vars:
+            category_filter_active = (
+                len(active_categories) != len(self._category_vars)
+                or not include_uncategorized
+            )
+        else:
+            category_filter_active = not include_uncategorized
+
+        inserted = 0
 
         for key, assignment in sorted_items:
             haystack = " ".join(
@@ -3046,6 +3413,32 @@ class TagsTab(ttk.Frame):
             ).lower()
             if query and query not in haystack:
                 continue
+
+            supplier_name = assignment.product.supplier or "Невідомий"
+            if supplier_filter and supplier_name not in supplier_filter:
+                continue
+
+            if status_filter == "pending" and not assignment.proposed_tags:
+                continue
+            if status_filter == "no_tags" and (
+                assignment.current_tags or assignment.proposed_tags or assignment.selected_tags
+            ):
+                continue
+            if status_filter == "confirmed" and not (
+                assignment.current_tags or assignment.selected_tags
+            ):
+                continue
+            if status_filter == "errors" and not assignment.validation_errors:
+                continue
+
+            if category_filter_active:
+                category_value = assignment.category
+                if category_value:
+                    if category_value not in active_categories:
+                        continue
+                else:
+                    if not include_uncategorized:
+                        continue
 
             current_display = ", ".join(sorted(assignment.current_tags)) or "—"
 
@@ -3098,6 +3491,15 @@ class TagsTab(ttk.Frame):
                 self.tree.item(item_id, tags=tuple(row_tags))
 
             self._item_to_key[item_id] = key
+            inserted += 1
+
+        total = len(self.assignments)
+        self.summary_var.set(f"Відбір: {inserted} з {total}")
+
+        if inserted == 0:
+            self._empty_label.place(relx=0.5, rely=0.5, anchor="center")
+        else:
+            self._empty_label.place_forget()
 
     def _on_tree_double_click(self, event: tk.Event[tk.Misc]) -> None:  # type: ignore[name-defined]
         item = self.tree.identify_row(event.y)
@@ -3151,6 +3553,7 @@ class TagsTab(ttk.Frame):
             assignment.selected_tags.update(auto_pending)
 
         tags_assignment.validate_tags([assignment], self.templates)
+        self._rebuild_category_filters()
         self._update_tree()
 
 
